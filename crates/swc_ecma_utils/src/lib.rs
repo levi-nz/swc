@@ -12,12 +12,18 @@ pub extern crate swc_common;
 #[doc(hidden)]
 pub extern crate swc_ecma_ast;
 
-use std::{borrow::Cow, hash::Hash, num::FpCategory, ops::Add};
+use std::{borrow::Cow, hash::Hash, mem::MaybeUninit, num::FpCategory, ops::Add};
 
 use number::ToJsString;
 use rustc_hash::{FxHashMap, FxHashSet};
 use swc_atoms::Atom;
 use swc_common::{util::take::Take, Mark, Span, Spanned, SyntaxContext, DUMMY_SP};
+use number::{JsNumber, ToJsString};
+use rustc_hash::FxHashMap;
+use swc_atoms::JsWord;
+use swc_common::{
+    collections::AHashSet, util::take::Take, Mark, Span, Spanned, SyntaxContext, DUMMY_SP,
+};
 use swc_ecma_ast::*;
 use swc_ecma_visit::{
     noop_visit_mut_type, noop_visit_type, visit_mut_obj_and_computed, visit_obj_and_computed,
@@ -726,6 +732,285 @@ pub trait ExprExt {
     #[inline(always)]
     fn cast_to_number(&self, ctx: ExprCtx) -> (Purity, Value<f64>) {
         cast_to_number(self.as_expr(), ctx)
+    fn cast_to_number(&self, ctx: &ExprCtx) -> (Purity, Value<f64>) {
+        let expr = self.as_expr();
+        let v = match expr {
+            Expr::Lit(l) => match l {
+                Lit::Bool(Bool { value: true, .. }) => 1.0,
+                Lit::Bool(Bool { value: false, .. }) | Lit::Null(..) => 0.0,
+                Lit::Num(Number { value: n, .. }) => *n,
+                Lit::Str(Str { value, .. }) => return (Pure, num_from_str(value)),
+                _ => return (Pure, Unknown),
+            },
+            Expr::Array(..) => {
+                let Known(s) = self.as_pure_string(ctx) else {
+                    return (Pure, Unknown);
+                };
+
+                return (Pure, num_from_str(&s));
+            }
+            Expr::Ident(Ident { sym, ctxt, .. }) => match &**sym {
+                "undefined" | "NaN" if *ctxt == ctx.unresolved_ctxt => f64::NAN,
+                "Infinity" if *ctxt == ctx.unresolved_ctxt => f64::INFINITY,
+                _ => return (Pure, Unknown),
+            },
+            Expr::Unary(UnaryExpr {
+                op: op!(unary, "-"),
+                arg,
+                ..
+            }) => match arg.cast_to_number(ctx) {
+                (Pure, Known(v)) => -v,
+                _ => return (MayBeImpure, Unknown),
+            },
+            Expr::Unary(UnaryExpr {
+                op: op!("!"),
+                ref arg,
+                ..
+            }) => match arg.cast_to_bool(ctx) {
+                (Pure, Known(v)) => {
+                    if v {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                _ => return (MayBeImpure, Unknown),
+            },
+            Expr::Unary(UnaryExpr {
+                op: op!("void"),
+                ref arg,
+                ..
+            }) => {
+                if arg.may_have_side_effects(ctx) {
+                    return (MayBeImpure, Known(f64::NAN));
+                } else {
+                    f64::NAN
+                }
+            }
+
+            Expr::Tpl(..) => {
+                return (
+                    Pure,
+                    num_from_str(&match self.as_pure_string(ctx) {
+                        Known(v) => v,
+                        Unknown => return (MayBeImpure, Unknown),
+                    }),
+                );
+            }
+
+            Expr::Seq(seq) => {
+                if let Some(last) = seq.exprs.last() {
+                    let (_, v) = last.cast_to_number(ctx);
+
+                    // TODO: Purity
+                    return (MayBeImpure, v);
+                }
+
+                return (MayBeImpure, Unknown);
+            }
+
+            Expr::Bin(bin) => {
+                let (left, right) = (bin.left.as_pure_number(ctx), bin.right.as_pure_number(ctx));
+
+                if (left.is_unknown() && right.is_unknown())
+                    || bin.op == op!(bin, "+")
+                        && (!bin.left.get_type().casted_to_number_on_add()
+                            || !bin.right.get_type().casted_to_number_on_add())
+                {
+                    return (MayBeImpure, Unknown);
+                }
+
+                match bin.op {
+                    op!("<<") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (
+                            Pure,
+                            Known(*(JsNumber::from(left) << JsNumber::from(right))),
+                        );
+                    }
+
+                    op!(">>") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (
+                            Pure,
+                            Known(*(JsNumber::from(left) >> JsNumber::from(right))),
+                        );
+                    }
+
+                    op!(">>>") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (
+                            Pure,
+                            Known(*(JsNumber::from(left).unsigned_shr(right.into()))),
+                        );
+                    }
+
+                    op!(bin, "+") => {
+                        if let (Known(left), Known(right)) = (left, right) {
+                            return (Pure, Known(*(JsNumber::from(left) + JsNumber::from(right))));
+                        }
+
+                        if left == Known(0.0) {
+                            return (Pure, right);
+                        } else if right == Known(0.0) {
+                            return (Pure, left);
+                        }
+
+                        return (MayBeImpure, Unknown);
+                    }
+
+                    op!(bin, "-") => {
+                        if let (Known(left), Known(right)) = (left, right) {
+                            return (Pure, Known(*(JsNumber::from(left) - JsNumber::from(right))));
+                        }
+
+                        // 0 - x => -x
+                        if left == Known(0.0) {
+                            return (Pure, right);
+                        }
+
+                        // x - 0 => x
+                        if right == Known(0.0) {
+                            return (Pure, left);
+                        }
+
+                        return (MayBeImpure, Unknown);
+                    }
+
+                    op!("*") => {
+                        if let (Known(left), Known(right)) = (left, right) {
+                            return (Pure, Known(*(JsNumber::from(left) * JsNumber::from(right))));
+                        }
+
+                        // NOTE: 0*x != 0 for all x, if x==0, then it is NaN.  So we can't take
+                        // advantage of that without some kind of non-NaN proof.  So the special
+                        // cases here only deal with 1*x
+                        if Known(1.0) == left {
+                            return (Pure, right);
+                        }
+                        if Known(1.0) == right {
+                            return (Pure, left);
+                        }
+
+                        return (MayBeImpure, Unknown);
+                    }
+
+                    op!("/") => {
+                        if let (Known(left), Known(right)) = (left, right) {
+                            if right == 0.0 {
+                                return (Pure, Unknown);
+                            }
+
+                            return (Pure, Known(*(JsNumber::from(left) / JsNumber::from(right))));
+                        }
+
+                        // NOTE: 0/x != 0 for all x, if x==0, then it is NaN
+
+                        if right == Known(1.0) {
+                            // TODO: cloneTree
+                            // x/1->x
+                            return (Pure, left);
+                        }
+
+                        return (MayBeImpure, Unknown);
+                    }
+
+                    op!("%") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (Pure, Known(*(JsNumber::from(left) % JsNumber::from(right))));
+                    }
+
+                    op!("|") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (Pure, Known(*(JsNumber::from(left) | JsNumber::from(right))));
+                    }
+
+                    op!("^") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (Pure, Known(*(JsNumber::from(left) ^ JsNumber::from(right))));
+                    }
+
+                    op!("&") => {
+                        let (Known(left), Known(right)) = (left, right) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (Pure, Known(*(JsNumber::from(left) & JsNumber::from(right))));
+                    }
+
+                    op!("||") => {
+                        let Known(left_bool) = bin.left.as_pure_bool(ctx) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (Pure, if left_bool { left } else { right });
+                    }
+
+                    op!("&&") => {
+                        let Known(left_bool) = bin.left.as_pure_bool(ctx) else {
+                            return (MayBeImpure, Unknown);
+                        };
+
+                        return (Pure, if left_bool { right } else { left });
+                    }
+
+                    op!("**") => {
+                        if Known(0.0) == right {
+                            return (Pure, Known(1.0));
+                        }
+
+                        if let (Known(left), Known(right)) = (left, right) {
+                            return (Pure, Known(*(JsNumber::from(left).pow(right.into()))));
+                        }
+
+                        return (MayBeImpure, Unknown);
+                    }
+
+                    op!("??") => {
+                        return (
+                            Pure,
+                            if bin.left.is_void()
+                                || bin.left.is_undefined(ctx)
+                                || bin
+                                    .left
+                                    .as_lit()
+                                    .is_some_and(|lit| matches!(lit, Lit::Null(..)))
+                            {
+                                right
+                            } else {
+                                left
+                            },
+                        );
+                    }
+
+                    _ => {}
+                }
+
+                return (MayBeImpure, Unknown);
+            }
+
+            _ => return (MayBeImpure, Unknown),
+        };
+
+        (Purity::Pure, Known(v))
     }
 
     /// Emulates javascript Number() cast function.
